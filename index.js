@@ -1,42 +1,42 @@
 const express = require('express');
-const https = require('https');
+const { request } = require('undici');
+const { HttpsProxyAgent } = require('https-proxy-agent');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 const TOKEN = process.env.DISCORD_TOKEN;
+const PROXY_URL = process.env.PROXY_URL; // Optional: http://user:pass@host:port
 
 app.use(express.json());
 app.use(express.static('public'));
 
 let botUser = null;
 
-function apiRequest(path) {
-  return new Promise((resolve) => {
-    const options = {
-      hostname: 'discord.com',
-      port: 443,
-      path: `/api/v10${path}`,
-      method: 'GET',
+const dispatcher = PROXY_URL 
+  ? new HttpsProxyAgent(PROXY_URL)
+  : undefined;
+
+async function apiRequest(path) {
+  try {
+    const { statusCode, body } = await request(`https://discord.com/api/v10${path}`, {
       headers: {
         'Authorization': TOKEN,
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-        'Accept': 'application/json'
-      }
-    };
-
-    const req = https.request(options, (res) => {
-      let data = '';
-      res.on('data', chunk => data += chunk);
-      res.on('end', () => {
-        try { resolve({ status: res.statusCode, data: JSON.parse(data) }); } 
-        catch { resolve({ status: res.statusCode, data }); }
-      });
+        'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 16_5 like Mac OS X) AppleWebKit/605.1.15',
+        'Accept': 'application/json',
+        'X-Super-Properties': Buffer.from(JSON.stringify({
+          os: 'iOS',
+          browser: 'Mobile Safari',
+          device: 'iPhone'
+        })).toString('base64')
+      },
+      dispatcher
     });
-
-    req.on('error', () => resolve({ status: 0, error: true }));
-    req.setTimeout(10000, () => { req.destroy(); resolve({ status: 0, error: true }); });
-    req.end();
-  });
+    
+    const data = await body.json().catch(() => null);
+    return { status: statusCode, data };
+  } catch (e) {
+    return { status: 0, error: e.message };
+  }
 }
 
 async function validateToken() {
@@ -44,96 +44,166 @@ async function validateToken() {
   const result = await apiRequest('/users/@me');
   if (result.status === 200) {
     botUser = result.data;
-    console.log(`Logged in as @${botUser.username}`);
     return true;
   }
   return false;
 }
 
-// Concurrent batch check - 20 at a time
-async function batchCheck(usernames, concurrency = 20) {
-  const results = { available: [], taken: [], errors: [] };
+async function batchCheck(usernames, concurrency = 10) {
+  const results = { available: [], taken: [], errors: [], rateLimited: false };
   const queue = [...usernames];
   
   async function worker() {
     while (queue.length > 0) {
       const user = queue.shift();
-      try {
-        const result = await apiRequest(`/users/${user}`);
-        if (result.status === 404) results.available.push(user);
-        else if (result.status === 200) results.taken.push(user);
-        else results.errors.push(user);
-      } catch (e) {
+      const result = await apiRequest(`/users/${user}`);
+      
+      if (result.status === 429) {
+        results.rateLimited = true;
+        results.errors.push(user);
+      } else if (result.status === 404) {
+        results.available.push(user);
+      } else if (result.status === 200) {
+        results.taken.push(user);
+      } else {
         results.errors.push(user);
       }
+      
+      // Small delay to avoid aggressive rate limiting
+      await new Promise(r => setTimeout(r, 100));
     }
   }
 
-  const workers = Array(concurrency).fill(null).map(() => worker());
-  await Promise.all(workers);
+  await Promise.all(Array(concurrency).fill(null).map(worker));
   return results;
 }
 
 app.get('/', async (req, res) => {
   const valid = await validateToken();
   
-  if (!valid) {
-    return res.send(`
-      <!DOCTYPE html>
-      <html>
-      <head>
-        <title>Discord Checker</title>
-        <style>
-          body { background: #0d0d0d; color: #fff; font-family: sans-serif; display: flex; justify-content: center; align-items: center; height: 100vh; margin: 0; }
-          .box { background: #1a1a1a; padding: 40px; border-radius: 12px; text-align: center; border: 1px solid #333; }
-          h1 { color: #ed4245; }
-          a { color: #5865f2; text-decoration: none; }
-        </style>
-      </head>
-      <body>
-        <div class="box">
-          <h1>⚠️ No Token</h1>
-          <p>Add DISCORD_TOKEN to Railway variables</p>
-          <p><a href="/searcher.html">Continue anyway →</a></p>
-        </div>
-      </body>
-      </html>
-    `);
-  }
-  
   res.send(`
     <!DOCTYPE html>
     <html>
     <head>
-      <title>Discord Checker - @${botUser.username}</title>
+      <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+      <title>Discord Checker</title>
       <style>
-        body { background: #0d0d0d; color: #fff; font-family: -apple-system, BlinkMacSystemFont, sans-serif; display: flex; justify-content: center; align-items: center; height: 100vh; margin: 0; }
-        .box { background: #1a1a1a; padding: 50px; border-radius: 16px; text-align: center; border: 1px solid #333; min-width: 400px; }
-        h1 { color: #3ba55d; margin-bottom: 10px; }
-        .user { display: flex; align-items: center; justify-content: center; gap: 15px; margin: 30px 0; }
-        .avatar { width: 64px; height: 64px; border-radius: 50%; background: linear-gradient(135deg, #5865f2, #4752c4); display: flex; align-items: center; justify-content: center; font-size: 28px; font-weight: bold; }
-        .info { text-align: left; }
-        .name { font-size: 24px; font-weight: 700; }
-        .id { color: #888; font-size: 13px; margin-top: 4px; }
-        button { background: #5865f2; color: #fff; border: none; padding: 16px 50px; border-radius: 8px; cursor: pointer; font-size: 16px; font-weight: 600; margin-top: 10px; }
-        button:hover { background: #4752c4; transform: translateY(-2px); transition: all 0.2s; }
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { 
+          background: #0a0a0a; 
+          color: #fff; 
+          font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+          min-height: 100vh;
+          display: flex;
+          flex-direction: column;
+          align-items: center;
+          justify-content: center;
+          padding: 20px;
+        }
+        .box { 
+          background: #111; 
+          padding: 30px; 
+          border-radius: 16px; 
+          text-align: center; 
+          border: 1px solid #222;
+          width: 100%;
+          max-width: 400px;
+        }
+        .status { 
+          width: 60px; 
+          height: 60px; 
+          border-radius: 50%; 
+          margin: 0 auto 20px;
+          display: flex;
+          align-items: center;
+          justify-content: center;
+          font-size: 28px;
+        }
+        .online { background: #3ba55d; }
+        .offline { background: #ed4245; }
+        h1 { font-size: 24px; margin-bottom: 10px; }
+        p { color: #888; margin-bottom: 25px; font-size: 14px; }
+        .user-info {
+          background: #1a1a1a;
+          padding: 15px;
+          border-radius: 12px;
+          margin-bottom: 25px;
+          display: flex;
+          align-items: center;
+          gap: 15px;
+          text-align: left;
+        }
+        .avatar { 
+          width: 50px; 
+          height: 50px; 
+          border-radius: 50%; 
+          background: #5865f2;
+          display: flex;
+          align-items: center;
+          justify-content: center;
+          font-size: 20px;
+          font-weight: bold;
+        }
+        .info { flex: 1; }
+        .username { font-weight: 600; font-size: 18px; }
+        .userid { color: #666; font-size: 12px; margin-top: 4px; }
+        button {
+          width: 100%;
+          background: ${valid ? '#5865f2' : '#333'};
+          color: #fff;
+          border: none;
+          padding: 16px;
+          border-radius: 12px;
+          cursor: ${valid ? 'pointer' : 'not-allowed'};
+          font-weight: 600;
+          font-size: 16px;
+        }
+        button:active { transform: scale(0.98); }
+        .proxy-status {
+          margin-top: 15px;
+          padding: 10px;
+          border-radius: 8px;
+          font-size: 12px;
+          color: ${PROXY_URL ? '#3ba55d' : '#faa61a'};
+          background: ${PROXY_URL ? 'rgba(59,165,93,0.1)' : 'rgba(250,166,26,0.1)'};
+        }
       </style>
     </head>
     <body>
       <div class="box">
-        <h1>✅ Connected</h1>
-        <div class="user">
+        <div class="status ${valid ? 'online' : 'offline'}">
+          ${valid ? '✓' : '✕'}
+        </div>
+        <h1>${valid ? 'Connected' : 'Not Connected'}</h1>
+        <p>${valid ? 'Ready to check usernames' : 'Add DISCORD_TOKEN to Railway variables'}</p>
+        
+        ${valid ? `
+        <div class="user-info">
           <div class="avatar">${botUser.username.charAt(0).toUpperCase()}</div>
           <div class="info">
-            <div class="name">@${botUser.username}</div>
-            <div class="id">${botUser.id}</div>
+            <div class="username">@${botUser.username}</div>
+            <div class="userid">${botUser.id}</div>
           </div>
         </div>
-        <button onclick="location.href='/searcher.html'">Launch Checker</button>
+        ` : ''}
+        
+        <button onclick="${valid ? "location.href='/app'" : 'alert(\'Configure token first\')'}" ${!valid ? 'disabled' : ''}>
+          ${valid ? 'Open Checker' : 'Configure Token'}
+        </button>
+        
+        <div class="proxy-status">
+          ${PROXY_URL ? '🟢 Proxy Enabled' : '🟡 No Proxy - May be blocked by Discord'}
+        </div>
       </div>
     </body>
     </html>
   `);
+});
+
+// Mobile app interface
+app.get('/app', (req, res) => {
+  if (!TOKEN) return res.redirect('/');
+  res.sendFile(__dirname + '/public/app.html');
 });
 
 app.get('/api/check/:username', async (req, res) => {
@@ -142,33 +212,31 @@ app.get('/api/check/:username', async (req, res) => {
   res.json({
     username: req.params.username,
     available: result.status === 404,
-    status: result.status
+    status: result.status,
+    rateLimited: result.status === 429
   });
 });
 
-// Mass check endpoint - 100+ at once
 app.post('/api/mass-check', async (req, res) => {
   if (!TOKEN) return res.status(500).json({ error: 'No token' });
   
-  const { usernames, concurrency = 20 } = req.body;
+  const { usernames, concurrency = 8 } = req.body;
   if (!Array.isArray(usernames)) return res.status(400).json({ error: 'Array required' });
   
   const startTime = Date.now();
-  const results = await batchCheck(usernames.slice(0, 100), concurrency);
+  const results = await batchCheck(usernames.slice(0, 50), concurrency);
   
   res.json({
     ...results,
-    total_checked: usernames.length,
-    available_count: results.available.length,
-    taken_count: results.taken.length,
+    total: usernames.length,
     time_ms: Date.now() - startTime,
-    checked_by: botUser?.username
+    used_proxy: !!PROXY_URL
   });
 });
 
 app.get('/api/gen/:type/:count', (req, res) => {
-  const type = req.params.type; // '3', '4', '5', 'any'
-  const count = Math.min(parseInt(req.params.count) || 50, 100);
+  const type = req.params.type;
+  const count = Math.min(parseInt(req.params.count) || 30, 50);
   const chars = 'abcdefghijklmnopqrstuvwxyz0123456789_';
   
   const names = [];
@@ -178,10 +246,9 @@ app.get('/api/gen/:type/:count', (req, res) => {
     for (let j = 0; j < len; j++) name += chars[Math.floor(Math.random() * chars.length)];
     names.push(name);
   }
-  res.json({ usernames: names, type, count });
+  res.json({ usernames: names });
 });
 
-app.listen(PORT, () => {
-  validateToken();
-  console.log(`Running on ${PORT}`);
+validateToken().then(() => {
+  app.listen(PORT, () => console.log(`Port ${PORT}`));
 });
