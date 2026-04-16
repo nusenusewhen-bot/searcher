@@ -1,123 +1,98 @@
 const express = require('express');
-const axios = require('axios');
-const cors = require('cors');
-require('dotenv').config();
+const { request } = require('undici');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
+const TOKEN = process.env.DISCORD_TOKEN;
 
-app.use(cors());
 app.use(express.json());
 app.use(express.static('public'));
 
-// Discord API configuration
-const DISCORD_API = 'https://discord.com/api/v9';
-const DISCORD_TOKEN = process.env.DISCORD_TOKEN; // User account token required
-
-// Check single username availability
+// Check username via Discord's friends lookup endpoint
 app.get('/api/check/:username', async (req, res) => {
-    const { username } = req.params;
+  if (!TOKEN) return res.status(500).json({ error: 'No token' });
+  
+  const username = req.params.username;
+  
+  try {
+    // Try to lookup user by username - 200 means exists, 404 means available
+    const { statusCode, body } = await request(
+      `https://discord.com/api/v9/users/${username}`, 
+      {
+        headers: {
+          'Authorization': TOKEN,
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+        }
+      }
+    );
     
+    await body.dump(); // drain body
+    
+    // 404 = username available, 200 = taken
+    res.json({
+      username,
+      available: statusCode === 404,
+      status: statusCode
+    });
+    
+  } catch (err) {
+    res.json({ username, available: false, error: err.message });
+  }
+});
+
+// Generate usernames
+app.get('/api/gen/:len/:count', (req, res) => {
+  const len = parseInt(req.params.len) || 4;
+  const count = Math.min(parseInt(req.params.count) || 20, 50);
+  const chars = 'abcdefghijklmnopqrstuvwxyz0123456789';
+  
+  const names = [];
+  for (let i = 0; i < count; i++) {
+    let name = '';
+    for (let j = 0; j < len; j++) {
+      name += chars[Math.floor(Math.random() * chars.length)];
+    }
+    names.push(name);
+  }
+  
+  res.json({ usernames: names, length: len, count });
+});
+
+// Batch check with delay
+app.post('/api/batch', async (req, res) => {
+  const { usernames } = req.body;
+  if (!Array.isArray(usernames)) return res.status(400).json({ error: 'Array required' });
+  
+  const results = [];
+  
+  for (const user of usernames.slice(0, 30)) {
     try {
-        const response = await axios.get(`${DISCORD_API}/users/@me`, {
-            headers: {
-                'Authorization': DISCORD_TOKEN,
-                'Content-Type': 'application/json'
-            },
-            // Alternative: Check username via registration flow simulation
-        });
-
-        // Discord doesn't have a public endpoint for username checking
-        // Workaround: Attempt registration check or profile lookup
-        const checkResponse = await axios.post(
-            `${DISCORD_API}/auth/register/check-username`,
-            { username: username },
-            {
-                headers: {
-                    'Content-Type': 'application/json',
-                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-                }
-            }
-        );
-
-        res.json({
-            username: username,
-            available: checkResponse.data.available || false,
-            taken: checkResponse.data.taken || true
-        });
-
-    } catch (error) {
-        // If 400/409, username likely taken
-        // If 200, might be available
-        res.json({
-            username: username,
-            available: error.response?.status === 200,
-            error: error.response?.data?.message || 'Check failed'
-        });
-    }
-});
-
-// Batch check usernames
-app.post('/api/check-batch', async (req, res) => {
-    const { usernames } = req.body;
-    const results = [];
-
-    for (const username of usernames) {
-        try {
-            await new Promise(resolve => setTimeout(resolve, 1000)); // Rate limit protection
-            
-            const response = await axios.post(
-                `${DISCORD_API}/auth/register/check-username`,
-                { username: username },
-                {
-                    headers: {
-                        'Content-Type': 'application/json',
-                        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-                    }
-                }
-            );
-            
-            results.push({
-                username,
-                available: response.data.available,
-                timestamp: new Date().toISOString()
-            });
-        } catch (error) {
-            results.push({
-                username,
-                available: false,
-                taken: true,
-                error: error.message
-            });
+      const { statusCode, body } = await request(
+        `https://discord.com/api/v9/users/${user}`,
+        {
+          headers: {
+            'Authorization': TOKEN,
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+          }
         }
+      );
+      await body.dump();
+      
+      results.push({
+        username: user,
+        available: statusCode === 404,
+        checked: new Date().toISOString()
+      });
+      
+      // Rate limit protection
+      await new Promise(r => setTimeout(r, 500));
+      
+    } catch (e) {
+      results.push({ username: user, available: false, error: e.message });
     }
-
-    res.json({ results });
+  }
+  
+  res.json({ results, total: results.length });
 });
 
-// Generate username patterns
-app.get('/api/generate/:type', (req, res) => {
-    const { type } = req.params; // '3', '4', 'any'
-    const count = parseInt(req.query.count) || 10;
-    const usernames = [];
-
-    const chars = 'abcdefghijklmnopqrstuvwxyz0123456789_';
-    
-    for (let i = 0; i < count; i++) {
-        let username = '';
-        const length = type === '3' ? 3 : type === '4' ? 4 : Math.floor(Math.random() * 5) + 3;
-        
-        for (let j = 0; j < length; j++) {
-            username += chars[Math.floor(Math.random() * chars.length)];
-        }
-        
-        usernames.push(username);
-    }
-
-    res.json({ usernames, type, generated: count });
-});
-
-// Start server
-app.listen(PORT, () => {
-    console.log(`Discord Username Checker running on port ${PORT}`);
-});
+app.listen(PORT, () => console.log(`Live on port ${PORT}`));
