@@ -1,0 +1,249 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Discord Username Checker</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            background: #36393f;
+            color: #dcddde;
+            font-family: 'Whitney', 'Helvetica Neue', Helvetica, Arial, sans-serif;
+            min-height: 100vh;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            padding: 40px 20px;
+        }
+        .container {
+            max-width: 800px;
+            width: 100%;
+        }
+        h1 {
+            color: #fff;
+            margin-bottom: 30px;
+            text-align: center;
+            font-size: 32px;
+        }
+        .search-box {
+            background: #40444b;
+            padding: 30px;
+            border-radius: 8px;
+            margin-bottom: 30px;
+        }
+        .input-group {
+            display: flex;
+            gap: 10px;
+            margin-bottom: 20px;
+        }
+        input[type="text"] {
+            flex: 1;
+            padding: 12px 16px;
+            background: #2f3136;
+            border: 1px solid #202225;
+            color: #dcddde;
+            border-radius: 4px;
+            font-size: 16px;
+        }
+        button {
+            padding: 12px 24px;
+            background: #5865f2;
+            color: white;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 16px;
+            font-weight: 500;
+            transition: background 0.2s;
+        }
+        button:hover { background: #4752c4; }
+        .options {
+            display: flex;
+            gap: 15px;
+            flex-wrap: wrap;
+            justify-content: center;
+        }
+        .option-btn {
+            background: #2f3136;
+            padding: 10px 20px;
+            border: 2px solid transparent;
+        }
+        .option-btn.active {
+            border-color: #5865f2;
+            background: #40444b;
+        }
+        .results {
+            background: #40444b;
+            border-radius: 8px;
+            padding: 20px;
+            min-height: 200px;
+        }
+        .result-item {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 15px;
+            background: #2f3136;
+            margin-bottom: 10px;
+            border-radius: 4px;
+            border-left: 4px solid;
+        }
+        .result-item.available {
+            border-left-color: #3ba55d;
+        }
+        .result-item.taken {
+            border-left-color: #ed4245;
+        }
+        .status {
+            padding: 6px 12px;
+            border-radius: 20px;
+            font-size: 14px;
+            font-weight: 600;
+        }
+        .status.available {
+            background: #3ba55d;
+            color: white;
+        }
+        .status.taken {
+            background: #ed4245;
+            color: white;
+        }
+        .loading {
+            text-align: center;
+            color: #b9bbbe;
+            padding: 40px;
+        }
+        .batch-controls {
+            margin-top: 20px;
+            padding-top: 20px;
+            border-top: 1px solid #2f3136;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🔍 Discord Username Checker</h1>
+        
+        <div class="search-box">
+            <div class="input-group">
+                <input type="text" id="usernameInput" placeholder="Enter username to check...">
+                <button onclick="checkUsername()">Check</button>
+            </div>
+            
+            <div class="options">
+                <button class="option-btn" onclick="setSearchType('3')">3 Letters</button>
+                <button class="option-btn" onclick="setSearchType('4')">4 Letters</button>
+                <button class="option-btn active" onclick="setSearchType('any')">Any Length</button>
+                <button class="option-btn" onclick="generateAndCheck()">Generate & Check</button>
+            </div>
+
+            <div class="batch-controls">
+                <button onclick="batchCheck()" style="width: 100%; background: #3ba55d;">
+                    Check 50 Random Usernames
+                </button>
+            </div>
+        </div>
+
+        <div class="results" id="results">
+            <div class="loading">Results will appear here...</div>
+        </div>
+    </div>
+
+    <script>
+        let currentType = 'any';
+
+        function setSearchType(type) {
+            currentType = type;
+            document.querySelectorAll('.option-btn').forEach(btn => {
+                btn.classList.remove('active');
+                if (btn.textContent.includes(type === '3' ? '3' : type === '4' ? '4' : 'Any')) {
+                    btn.classList.add('active');
+                }
+            });
+        }
+
+        async function checkUsername() {
+            const username = document.getElementById('usernameInput').value.trim();
+            if (!username) return alert('Enter a username');
+            
+            const resultsDiv = document.getElementById('results');
+            resultsDiv.innerHTML = '<div class="loading">Checking...</div>';
+
+            try {
+                const response = await fetch(`/api/check/${username}`);
+                const data = await response.json();
+                
+                displayResults([data]);
+            } catch (error) {
+                resultsDiv.innerHTML = `<div class="loading">Error: ${error.message}</div>`;
+            }
+        }
+
+        async function generateAndCheck() {
+            const resultsDiv = document.getElementById('results');
+            resultsDiv.innerHTML = '<div class="loading">Generating and checking...</div>';
+
+            try {
+                const genResponse = await fetch(`/api/generate/${currentType}?count=10`);
+                const genData = await genResponse.json();
+                
+                const checkResponse = await fetch('/api/check-batch', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ usernames: genData.usernames })
+                });
+                
+                const checkData = await checkResponse.json();
+                displayResults(checkData.results);
+            } catch (error) {
+                resultsDiv.innerHTML = `<div class="loading">Error: ${error.message}</div>`;
+            }
+        }
+
+        async function batchCheck() {
+            const resultsDiv = document.getElementById('results');
+            resultsDiv.innerHTML = '<div class="loading">Running batch check (this may take a minute)...</div>';
+
+            try {
+                const genResponse = await fetch(`/api/generate/${currentType}?count=50`);
+                const genData = await genResponse.json();
+                
+                const checkResponse = await fetch('/api/check-batch', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ usernames: genData.usernames })
+                });
+                
+                const checkData = await checkResponse.json();
+                displayResults(checkData.results);
+            } catch (error) {
+                resultsDiv.innerHTML = `<div class="loading">Error: ${error.message}</div>`;
+            }
+        }
+
+        function displayResults(results) {
+            const resultsDiv = document.getElementById('results');
+            
+            if (!results || results.length === 0) {
+                resultsDiv.innerHTML = '<div class="loading">No results</div>';
+                return;
+            }
+
+            resultsDiv.innerHTML = results.map(result => `
+                <div class="result-item ${result.available ? 'available' : 'taken'}">
+                    <span style="font-size: 18px; font-weight: 600;">${result.username}</span>
+                    <span class="status ${result.available ? 'available' : 'taken'}">
+                        ${result.available ? '✓ AVAILABLE' : '✗ TAKEN'}
+                    </span>
+                </div>
+            `).join('');
+        }
+
+        // Allow Enter key to submit
+        document.getElementById('usernameInput').addEventListener('keypress', (e) => {
+            if (e.key === 'Enter') checkUsername();
+        });
+    </script>
+</body>
+</html>
