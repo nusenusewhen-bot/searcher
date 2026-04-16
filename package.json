@@ -3,7 +3,8 @@
   "version": "1.0.0",
   "dependencies": {
     "express": "^4.18.2",
-    "undici": "^5.28.0"
+    "undici": "^5.28.0",
+    "https-proxy-agent": "^7.0.2"
   },
   "scripts": {
     "start": "node index.js"
