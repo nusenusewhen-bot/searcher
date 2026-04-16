@@ -8,20 +8,18 @@ const TOKEN = process.env.DISCORD_TOKEN;
 app.use(express.json());
 app.use(express.static('public'));
 
-// Store user info after validation
 let botUser = null;
 
-function apiRequest(path, method = 'GET', body = null) {
-  return new Promise((resolve, reject) => {
+function apiRequest(path) {
+  return new Promise((resolve) => {
     const options = {
       hostname: 'discord.com',
       port: 443,
       path: `/api/v10${path}`,
-      method: method,
+      method: 'GET',
       headers: {
         'Authorization': TOKEN,
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.0.36',
-        'Content-Type': 'application/json',
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
         'Accept': 'application/json'
       }
     };
@@ -30,65 +28,73 @@ function apiRequest(path, method = 'GET', body = null) {
       let data = '';
       res.on('data', chunk => data += chunk);
       res.on('end', () => {
-        try {
-          resolve({ status: res.statusCode, data: JSON.parse(data) });
-        } catch {
-          resolve({ status: res.statusCode, data: data });
-        }
+        try { resolve({ status: res.statusCode, data: JSON.parse(data) }); } 
+        catch { resolve({ status: res.statusCode, data }); }
       });
     });
 
-    req.on('error', reject);
-    if (body) req.write(JSON.stringify(body));
+    req.on('error', () => resolve({ status: 0, error: true }));
+    req.setTimeout(10000, () => { req.destroy(); resolve({ status: 0, error: true }); });
     req.end();
   });
 }
 
-// Validate token on startup and get user info
 async function validateToken() {
-  if (!TOKEN) {
-    console.log('⚠️ No DISCORD_TOKEN provided');
-    return false;
+  if (!TOKEN) return false;
+  const result = await apiRequest('/users/@me');
+  if (result.status === 200) {
+    botUser = result.data;
+    console.log(`Logged in as @${botUser.username}`);
+    return true;
   }
-  try {
-    const result = await apiRequest('/users/@me');
-    if (result.status === 200) {
-      botUser = result.data;
-      console.log(`✅ Logged in as @${botUser.username}`);
-      return true;
-    } else {
-      console.log('❌ Invalid token');
-      return false;
-    }
-  } catch (e) {
-    console.log('❌ Token validation failed:', e.message);
-    return false;
-  }
+  return false;
 }
 
-// Root route - serves login status
-app.get('/', async (req, res) => {
-  const isValid = await validateToken();
+// Concurrent batch check - 20 at a time
+async function batchCheck(usernames, concurrency = 20) {
+  const results = { available: [], taken: [], errors: [] };
+  const queue = [...usernames];
   
-  if (!isValid) {
+  async function worker() {
+    while (queue.length > 0) {
+      const user = queue.shift();
+      try {
+        const result = await apiRequest(`/users/${user}`);
+        if (result.status === 404) results.available.push(user);
+        else if (result.status === 200) results.taken.push(user);
+        else results.errors.push(user);
+      } catch (e) {
+        results.errors.push(user);
+      }
+    }
+  }
+
+  const workers = Array(concurrency).fill(null).map(() => worker());
+  await Promise.all(workers);
+  return results;
+}
+
+app.get('/', async (req, res) => {
+  const valid = await validateToken();
+  
+  if (!valid) {
     return res.send(`
       <!DOCTYPE html>
       <html>
       <head>
-        <title>Discord Checker - Not Logged In</title>
+        <title>Discord Checker</title>
         <style>
           body { background: #0d0d0d; color: #fff; font-family: sans-serif; display: flex; justify-content: center; align-items: center; height: 100vh; margin: 0; }
           .box { background: #1a1a1a; padding: 40px; border-radius: 12px; text-align: center; border: 1px solid #333; }
-          h1 { color: #ed4245; margin-bottom: 20px; }
-          p { color: #888; }
+          h1 { color: #ed4245; }
           a { color: #5865f2; text-decoration: none; }
         </style>
       </head>
       <body>
         <div class="box">
-          <h1>⚠️ Not Logged In</h1>
-          <p>Set DISCORD_TOKEN in Railway variables</p>
-          <p><a href="/searcher.html">Try anyway →</a></p>
+          <h1>⚠️ No Token</h1>
+          <p>Add DISCORD_TOKEN to Railway variables</p>
+          <p><a href="/searcher.html">Continue anyway →</a></p>
         </div>
       </body>
       </html>
@@ -101,16 +107,16 @@ app.get('/', async (req, res) => {
     <head>
       <title>Discord Checker - @${botUser.username}</title>
       <style>
-        body { background: #0d0d0d; color: #fff; font-family: sans-serif; display: flex; justify-content: center; align-items: center; height: 100vh; margin: 0; }
-        .box { background: #1a1a1a; padding: 40px; border-radius: 12px; text-align: center; border: 1px solid #333; }
-        h1 { color: #3ba55d; margin-bottom: 20px; }
-        .user { display: flex; align-items: center; justify-content: center; gap: 15px; margin-bottom: 30px; }
-        .avatar { width: 64px; height: 64px; border-radius: 50%; background: #5865f2; display: flex; align-items: center; justify-content: center; font-size: 28px; font-weight: bold; }
+        body { background: #0d0d0d; color: #fff; font-family: -apple-system, BlinkMacSystemFont, sans-serif; display: flex; justify-content: center; align-items: center; height: 100vh; margin: 0; }
+        .box { background: #1a1a1a; padding: 50px; border-radius: 16px; text-align: center; border: 1px solid #333; min-width: 400px; }
+        h1 { color: #3ba55d; margin-bottom: 10px; }
+        .user { display: flex; align-items: center; justify-content: center; gap: 15px; margin: 30px 0; }
+        .avatar { width: 64px; height: 64px; border-radius: 50%; background: linear-gradient(135deg, #5865f2, #4752c4); display: flex; align-items: center; justify-content: center; font-size: 28px; font-weight: bold; }
         .info { text-align: left; }
-        .username { font-size: 24px; font-weight: 600; color: #fff; }
-        .id { color: #888; font-size: 14px; }
-        button { background: #5865f2; color: #fff; border: none; padding: 15px 40px; border-radius: 8px; cursor: pointer; font-size: 16px; font-weight: 600; }
-        button:hover { background: #4752c4; }
+        .name { font-size: 24px; font-weight: 700; }
+        .id { color: #888; font-size: 13px; margin-top: 4px; }
+        button { background: #5865f2; color: #fff; border: none; padding: 16px 50px; border-radius: 8px; cursor: pointer; font-size: 16px; font-weight: 600; margin-top: 10px; }
+        button:hover { background: #4752c4; transform: translateY(-2px); transition: all 0.2s; }
       </style>
     </head>
     <body>
@@ -119,81 +125,63 @@ app.get('/', async (req, res) => {
         <div class="user">
           <div class="avatar">${botUser.username.charAt(0).toUpperCase()}</div>
           <div class="info">
-            <div class="username">@${botUser.username}</div>
-            <div class="id">ID: ${botUser.id}</div>
+            <div class="name">@${botUser.username}</div>
+            <div class="id">${botUser.id}</div>
           </div>
         </div>
-        <button onclick="location.href='/searcher.html'">Open Checker</button>
+        <button onclick="location.href='/searcher.html'">Launch Checker</button>
       </div>
     </body>
     </html>
   `);
 });
 
-// Check username availability
 app.get('/api/check/:username', async (req, res) => {
-  if (!TOKEN) return res.status(500).json({ error: 'No token configured' });
-  
-  const username = req.params.username.toLowerCase().replace(/[^a-z0-9_.]/g, '');
-  
-  try {
-    // Try to get user by username - 200 = exists, 404 = available
-    const result = await apiRequest(`/users/${username}`);
-    
-    res.json({
-      username: username,
-      available: result.status === 404,
-      taken: result.status === 200,
-      status: result.status
-    });
-  } catch (e) {
-    res.json({ username: username, available: false, error: e.message });
-  }
+  if (!TOKEN) return res.status(500).json({ error: 'No token' });
+  const result = await apiRequest(`/users/${req.params.username.toLowerCase()}`);
+  res.json({
+    username: req.params.username,
+    available: result.status === 404,
+    status: result.status
+  });
 });
 
-// Generate usernames
-app.get('/api/gen/:len/:count', (req, res) => {
-  const len = Math.min(parseInt(req.params.len) || 4, 32);
-  const count = Math.min(parseInt(req.params.count) || 20, 100);
+// Mass check endpoint - 100+ at once
+app.post('/api/mass-check', async (req, res) => {
+  if (!TOKEN) return res.status(500).json({ error: 'No token' });
+  
+  const { usernames, concurrency = 20 } = req.body;
+  if (!Array.isArray(usernames)) return res.status(400).json({ error: 'Array required' });
+  
+  const startTime = Date.now();
+  const results = await batchCheck(usernames.slice(0, 100), concurrency);
+  
+  res.json({
+    ...results,
+    total_checked: usernames.length,
+    available_count: results.available.length,
+    taken_count: results.taken.length,
+    time_ms: Date.now() - startTime,
+    checked_by: botUser?.username
+  });
+});
+
+app.get('/api/gen/:type/:count', (req, res) => {
+  const type = req.params.type; // '3', '4', '5', 'any'
+  const count = Math.min(parseInt(req.params.count) || 50, 100);
   const chars = 'abcdefghijklmnopqrstuvwxyz0123456789_';
   
   const names = [];
   for (let i = 0; i < count; i++) {
+    const len = type === 'any' ? Math.floor(Math.random() * 3) + 3 : parseInt(type);
     let name = '';
     for (let j = 0; j < len; j++) name += chars[Math.floor(Math.random() * chars.length)];
     names.push(name);
   }
-  res.json({ usernames: names, length: len, count });
+  res.json({ usernames: names, type, count });
 });
 
-// Batch check
-app.post('/api/batch', async (req, res) => {
-  const { usernames } = req.body;
-  if (!Array.isArray(usernames)) return res.status(400).json({ error: 'Send array' });
-  
-  const results = [];
-  for (const user of usernames.slice(0, 30)) {
-    try {
-      const result = await apiRequest(`/users/${user}`);
-      results.push({
-        username: user,
-        available: result.status === 404,
-        status: result.status
-      });
-      await new Promise(r => setTimeout(r, 500));
-    } catch (e) {
-      results.push({ username: user, error: e.message });
-    }
-  }
-  res.json({ results, checked_as: botUser?.username });
-});
-
-// Health check
-app.get('/health', (req, res) => res.json({ 
-  status: botUser ? 'logged_in' : 'no_token',
-  user: botUser ? { username: botUser.username, id: botUser.id } : null
-}));
-
-validateToken().then(() => {
-  app.listen(PORT, () => console.log(`Live on port ${PORT}`));
+app.listen(PORT, () => {
+  validateToken();
+  console.log(`Running on ${PORT}`);
 });
