@@ -1,245 +1,66 @@
 const express = require('express');
 const https = require('https');
-const http = require('http');
-const { HttpsProxyAgent } = require('https-proxy-agent');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 const TOKEN = process.env.DISCORD_TOKEN;
 
-// Built-in proxy sources - mix of free and premium endpoints
-const PROXY_SOURCES = [
-  'http://api.proxyscrape.com/v2/?request=displayproxies&protocol=http&timeout=10000&country=all&ssl=all&anonymity=all',
-  'https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/http.txt',
-  'https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/http.txt',
-  'https://raw.githubusercontent.com/clarketm/proxy-list/master/proxy-list-raw.txt'
-];
+app.use(express.json());
 
 let botUser = null;
-let currentProxy = 0;
-let workingProxies = [];
-let failedProxies = new Set();
-let proxyStats = { total: 0, working: 0, failed: 0 };
+let requestQueue = [];
+let processing = false;
 
-// Scrape proxies from multiple sources
-async function scrapeProxies() {
-  const allProxies = new Set();
-  
-  // Add environment proxies first (premium/residential)
-  const envProxies = (process.env.PROXY_LIST || '').split(',').filter(p => p.trim());
-  envProxies.forEach(p => allProxies.add(p.trim()));
+// Rate limit management
+let lastRequest = 0;
+const MIN_DELAY = 1000; // 1 second between requests to stay within limits
 
-  // Scrape free lists
-  for (const source of PROXY_SOURCES) {
-    try {
-      const proxies = await fetchProxyList(source);
-      proxies.forEach(p => allProxies.add(p));
-    } catch (e) {
-      console.log(`Failed to scrape ${source}: ${e.message}`);
-    }
-  }
-
-  const uniqueProxies = Array.from(allProxies).filter(p => p.includes(':'));
-  console.log(`Scraped ${uniqueProxies.length} unique proxies`);
-  return uniqueProxies;
-}
-
-function fetchProxyList(url) {
-  return new Promise((resolve, reject) => {
-    const client = url.startsWith('https') ? https : http;
-    const req = client.get(url, { timeout: 15000 }, (res) => {
-      let data = '';
-      res.on('data', chunk => data += chunk);
-      res.on('end', () => {
-        const proxies = data.split('\n')
-          .map(line => line.trim())
-          .filter(line => line && !line.startsWith('#'))
-          .map(line => {
-            // Convert ip:port format to http://ip:port
-            if (!line.startsWith('http')) return `http://${line}`;
-            return line;
-          });
-        resolve(proxies);
-      });
-    });
-    req.on('error', reject);
-    req.on('timeout', () => { req.destroy(); reject(new Error('Timeout')); });
-  });
-}
-
-// Fast proxy validation
-async function validateProxy(proxyUrl) {
+async function discordRequest(path) {
   return new Promise((resolve) => {
-    const agent = new HttpsProxyAgent(proxyUrl);
-    const start = Date.now();
+    const now = Date.now();
+    const wait = Math.max(0, MIN_DELAY - (now - lastRequest));
     
-    const options = {
-      hostname: 'discord.com',
-      port: 443,
-      path: '/api/v10/gateway',
-      method: 'GET',
-      agent: agent,
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-      },
-      timeout: 8000
-    };
-
-    const req = https.request(options, (res) => {
-      const latency = Date.now() - start;
-      resolve({ 
-        proxy: proxyUrl, 
-        working: res.statusCode === 200, 
-        latency: latency 
-      });
-    });
-
-    req.on('error', () => resolve({ proxy: proxyUrl, working: false, latency: 99999 }));
-    req.on('timeout', () => { 
-      req.destroy(); 
-      resolve({ proxy: proxyUrl, working: false, latency: 99999 }); 
-    });
-    req.end();
-  });
-}
-
-// Test all proxies and keep only working ones
-async function initProxies() {
-  const scraped = await scrapeProxies();
-  proxyStats.total = scraped.length;
-  
-  console.log(`Testing ${scraped.length} proxies...`);
-  
-  // Test in batches of 50 for speed
-  const batchSize = 50;
-  workingProxies = [];
-  
-  for (let i = 0; i < scraped.length; i += batchSize) {
-    const batch = scraped.slice(i, i + batchSize);
-    const results = await Promise.all(batch.map(p => validateProxy(p)));
-    
-    const batchWorking = results.filter(r => r.working).map(r => r.proxy);
-    workingProxies.push(...batchWorking);
-    
-    console.log(`Batch ${i/batchSize + 1}: ${batchWorking.length}/${batch.length} working`);
-  }
-
-  // Sort by reliability (environment proxies first, then by speed)
-  const envSet = new Set((process.env.PROXY_LIST || '').split(',').map(p => p.trim()));
-  workingProxies.sort((a, b) => {
-    const aIsPremium = envSet.has(a);
-    const bIsPremium = envSet.has(b);
-    if (aIsPremium && !bIsPremium) return -1;
-    if (!aIsPremium && bIsPremium) return 1;
-    return 0;
-  });
-
-  proxyStats.working = workingProxies.length;
-  proxyStats.failed = proxyStats.total - proxyStats.working;
-  
-  console.log(`Proxy pool ready: ${workingProxies.length}/${scraped.length} working`);
-  return workingProxies;
-}
-
-function getNextProxy() {
-  if (workingProxies.length === 0) return null;
-  
-  // Skip recently failed proxies
-  let attempts = 0;
-  let proxy;
-  
-  do {
-    proxy = workingProxies[currentProxy];
-    currentProxy = (currentProxy + 1) % workingProxies.length;
-    attempts++;
-  } while (failedProxies.has(proxy) && attempts < workingProxies.length);
-  
-  // Reset failed list if all marked bad
-  if (attempts >= workingProxies.length) {
-    failedProxies.clear();
-    console.log('Reset failed proxy cache, retrying all');
-  }
-  
-  return proxy;
-}
-
-function apiRequest(path, retryCount = 0) {
-  return new Promise((resolve) => {
-    const proxy = getNextProxy();
-    const agent = proxy ? new HttpsProxyAgent(proxy) : undefined;
-    
-    const options = {
-      hostname: 'discord.com',
-      port: 443,
-      path: `/api/v10${path}`,
-      method: 'GET',
-      headers: {
-        'Authorization': TOKEN,
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        'Accept': 'application/json',
-        'Accept-Language': 'en-US,en;q=0.9',
-        'X-RateLimit-Precision': 'millisecond'
-      },
-      agent: agent,
-      timeout: 15000
-    };
-
-    const req = https.request(options, (res) => {
-      let data = '';
-      res.on('data', chunk => data += chunk);
-      res.on('end', () => {
-        // Mark proxy failed on rate limit or cloudflare block
-        if ((res.statusCode === 429 || res.statusCode === 403 || res.statusCode === 1020) && proxy) {
-          failedProxies.add(proxy);
-          proxyStats.failed++;
-        }
-
-        // Auto-retry with new proxy on rate limit
-        if (res.statusCode === 429 && retryCount < 3 && workingProxies.length > 1) {
-          const retryAfter = Math.min(JSON.parse(data).retry_after || 1, 5);
-          setTimeout(() => {
-            resolve(apiRequest(path, retryCount + 1));
-          }, retryAfter * 1000);
-          return;
-        }
-        
-        try { 
-          resolve({ 
-            status: res.statusCode, 
-            data: JSON.parse(data), 
-            proxy: proxy,
-            headers: res.headers
-          }); 
-        } catch { 
-          resolve({ status: res.statusCode, data, proxy: proxy }); 
-        }
-      });
-    });
-
-    req.on('error', (err) => {
-      if (proxy) failedProxies.add(proxy);
+    setTimeout(() => {
+      lastRequest = Date.now();
       
-      // Retry on connection error
-      if (retryCount < 2 && workingProxies.length > 1) {
-        setTimeout(() => resolve(apiRequest(path, retryCount + 1)), 500);
-      } else {
-        resolve({ status: 0, error: err.message, proxy: proxy });
-      }
-    });
-    
-    req.setTimeout(15000, () => {
-      req.destroy();
-      if (proxy) failedProxies.add(proxy);
-      resolve({ status: 0, timeout: true, proxy: proxy });
-    });
-    
-    req.end();
+      const options = {
+        hostname: 'discord.com',
+        port: 443,
+        path: `/api/v10${path}`,
+        method: 'GET',
+        headers: {
+          'Authorization': TOKEN,
+          'User-Agent': 'DiscordBot (https://github.com/discord/discord-example-app, 1.0.0)',
+          'Accept': 'application/json'
+        },
+        timeout: 10000
+      };
+
+      const req = https.request(options, (res) => {
+        let data = '';
+        res.on('data', chunk => data += chunk);
+        res.on('end', () => {
+          try {
+            resolve({ status: res.statusCode, data: JSON.parse(data) });
+          } catch {
+            resolve({ status: res.statusCode, data: data });
+          }
+        });
+      });
+
+      req.on('error', (err) => resolve({ status: 0, error: err.message }));
+      req.on('timeout', () => {
+        req.destroy();
+        resolve({ status: 0, error: 'timeout' });
+      });
+      req.end();
+    }, wait);
   });
 }
 
 async function validateToken() {
   if (!TOKEN) return false;
-  const result = await apiRequest('/users/@me');
+  const result = await discordRequest('/users/@me');
   if (result.status === 200) {
     botUser = result.data;
     return true;
@@ -247,7 +68,94 @@ async function validateToken() {
   return false;
 }
 
-// Routes
+// Check single username
+app.get('/api/check/:username', async (req, res) => {
+  if (!TOKEN) return res.status(500).json({ error: 'No token configured' });
+  
+  const username = req.params.username.toLowerCase().replace(/\s/g, '');
+  
+  // Validate username format
+  if (!/^[a-z0-9_.]{2,32}$/.test(username)) {
+    return res.status(400).json({ error: 'Invalid username format' });
+  }
+  
+  const result = await discordRequest(`/users/${username}`);
+  
+  res.json({
+    username: username,
+    available: result.status === 404,
+    taken: result.status === 200,
+    invalid: result.status === 400,
+    rate_limited: result.status === 429,
+    status_code: result.status,
+    retry_after: result.data?.retry_after || null
+  });
+});
+
+// Check multiple usernames (sequential with delays)
+app.post('/api/check-batch', async (req, res) => {
+  if (!TOKEN) return res.status(500).json({ error: 'No token configured' });
+  
+  const { usernames } = req.body;
+  
+  if (!Array.isArray(usernames) || usernames.length === 0) {
+    return res.status(400).json({ error: 'Provide array of usernames' });
+  }
+  
+  if (usernames.length > 20) {
+    return res.status(400).json({ error: 'Max 20 usernames per batch' });
+  }
+  
+  const results = [];
+  const startTime = Date.now();
+  
+  for (const user of usernames) {
+    const cleanUser = user.toLowerCase().replace(/\s/g, '');
+    
+    if (!/^[a-z0-9_.]{2,32}$/.test(cleanUser)) {
+      results.push({ username: cleanUser, error: 'Invalid format', available: false });
+      continue;
+    }
+    
+    const result = await discordRequest(`/users/${cleanUser}`);
+    
+    results.push({
+      username: cleanUser,
+      available: result.status === 404,
+      taken: result.status === 200,
+      status_code: result.status
+    });
+  }
+  
+  res.json({
+    results: results,
+    total: usernames.length,
+    available_count: results.filter(r => r.available).length,
+    taken_count: results.filter(r => r.taken).length,
+    duration_ms: Date.now() - startTime
+  });
+});
+
+// Generate username suggestions
+app.get('/api/generate/:length/:count', (req, res) => {
+  const length = parseInt(req.params.length) || 4;
+  const count = Math.min(parseInt(req.params.count) || 10, 50);
+  const chars = 'abcdefghijklmnopqrstuvwxyz0123456789_';
+  
+  const names = [];
+  for (let i = 0; i < count; i++) {
+    let name = '';
+    const nameLength = length === 0 ? 2 + Math.floor(Math.random() * 5) : length;
+    for (let j = 0; j < nameLength; j++) {
+      name += chars[Math.floor(Math.random() * chars.length)];
+    }
+    names.push(name);
+  }
+  
+  res.json({ usernames: names, count: names.length });
+});
+
+// Frontend
 app.get('/', async (req, res) => {
   const valid = await validateToken();
   
@@ -256,145 +164,196 @@ app.get('/', async (req, res) => {
     <html>
     <head>
       <meta name="viewport" content="width=device-width, initial-scale=1.0">
-      <title>Proxy Checker - ${workingProxies.length} Proxies</title>
+      <title>Discord Username Checker</title>
       <style>
-        body { background: #0a0a0a; color: #fff; font-family: sans-serif; padding: 20px; max-width: 600px; margin: 0 auto; }
-        .card { background: #111; padding: 25px; border-radius: 12px; margin-bottom: 15px; border: 1px solid #222; }
-        h1 { font-size: 24px; margin-bottom: 15px; }
-        .stats { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 10px; margin: 15px 0; }
-        .stat { background: #0d0d0d; padding: 15px; border-radius: 8px; text-align: center; }
-        .stat-value { font-size: 28px; font-weight: bold; color: #5865f2; }
-        .stat-label { font-size: 12px; color: #666; margin-top: 5px; }
-        .status { display: inline-block; padding: 6px 12px; border-radius: 20px; font-size: 12px; font-weight: 600; margin-bottom: 15px; }
-        .ok { background: #3ba55d; }
-        .bad { background: #ed4245; }
-        button { width: 100%; padding: 15px; background: #5865f2; color: #fff; border: none; border-radius: 10px; font-size: 16px; font-weight: 600; cursor: pointer; margin-top: 10px; }
-        button:disabled { background: #333; color: #666; }
-        .refresh { background: #3ba55d; }
+        * { box-sizing: border-box; }
+        body { 
+          background: #36393f; 
+          color: #dcddde; 
+          font-family: 'Whitney', 'Helvetica Neue', Helvetica, Arial, sans-serif; 
+          padding: 20px; 
+          max-width: 600px; 
+          margin: 0 auto;
+          line-height: 1.5;
+        }
+        .header { 
+          background: #2f3136; 
+          padding: 20px; 
+          border-radius: 8px; 
+          margin-bottom: 20px;
+          border-bottom: 2px solid ${valid ? '#3ba55d' : '#ed4245'};
+        }
+        h1 { margin: 0 0 10px 0; font-size: 24px; color: #fff; }
+        .status { 
+          display: inline-block; 
+          padding: 4px 12px; 
+          border-radius: 12px; 
+          font-size: 12px; 
+          font-weight: 600;
+          background: ${valid ? '#3ba55d' : '#ed4245'};
+          color: #fff;
+        }
+        .card { 
+          background: #2f3136; 
+          padding: 20px; 
+          border-radius: 8px; 
+          margin-bottom: 15px; 
+        }
+        input, textarea { 
+          width: 100%; 
+          padding: 12px; 
+          background: #40444b; 
+          border: 1px solid #202225; 
+          border-radius: 4px; 
+          color: #dcddde;
+          font-size: 14px;
+          margin-bottom: 10px;
+        }
+        input:focus, textarea:focus {
+          outline: none;
+          border-color: #5865f2;
+        }
+        button { 
+          width: 100%; 
+          padding: 12px; 
+          background: #5865f2; 
+          color: #fff; 
+          border: none; 
+          border-radius: 4px; 
+          font-size: 14px; 
+          font-weight: 500;
+          cursor: pointer;
+          transition: background 0.2s;
+        }
+        button:hover { background: #4752c4; }
+        button:disabled { background: #4f545c; cursor: not-allowed; }
+        .result { 
+          padding: 12px; 
+          border-radius: 4px; 
+          margin-top: 10px;
+          font-family: monospace;
+          font-size: 13px;
+        }
+        .available { background: rgba(59, 165, 93, 0.2); color: #3ba55d; border: 1px solid #3ba55d; }
+        .taken { background: rgba(237, 66, 69, 0.2); color: #ed4245; border: 1px solid #ed4245; }
+        .error { background: rgba(250, 166, 26, 0.2); color: #faa61a; border: 1px solid #faa61a; }
+        .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+        .info { font-size: 12px; color: #72767d; margin-top: 5px; }
+        #results { margin-top: 15px; }
+        .loading { opacity: 0.6; pointer-events: none; }
       </style>
     </head>
     <body>
-      <div class="card">
-        <h1>🔌 Proxy Rotator</h1>
-        <span class="status ${valid ? 'ok' : 'bad'}">${valid ? 'Connected' : 'No Token'}</span>
-        
-        <div class="stats">
-          <div class="stat">
-            <div class="stat-value">${proxyStats.total}</div>
-            <div class="stat-label">Scraped</div>
-          </div>
-          <div class="stat">
-            <div class="stat-value" style="color:#3ba55d">${proxyStats.working}</div>
-            <div class="stat-label">Working</div>
-          </div>
-          <div class="stat">
-            <div class="stat-value" style="color:#ed4245">${proxyStats.failed}</div>
-            <div class="stat-label">Failed</div>
-          </div>
-        </div>
-
-        ${valid ? `
-        <button onclick="location.href='/app'">Start Checker</button>
-        <button class="refresh" onclick="fetch('/api/refresh-proxies').then(()=>location.reload())" style="margin-top:10px;background:#3ba55d;">Refresh Proxies</button>
-        ` : `<button disabled>Configure DISCORD_TOKEN</button>`}
+      <div class="header">
+        <h1>🔍 Discord Username Checker</h1>
+        <span class="status">${valid ? 'Bot Connected' : 'Token Required'}</span>
+        ${valid ? `<div class="info">Logged in as: ${botUser?.username || 'Unknown'}</div>` : ''}
       </div>
+
+      ${valid ? `
+      <div class="card">
+        <h3 style="margin-top:0;color:#fff;">Single Check</h3>
+        <input type="text" id="single" placeholder="Enter username..." maxlength="32">
+        <button onclick="checkSingle()">Check Availability</button>
+        <div id="single-result"></div>
+      </div>
+
+      <div class="card">
+        <h3 style="margin-top:0;color:#fff;">Batch Check (Max 20)</h3>
+        <textarea id="batch" rows="4" placeholder="username1&#10;username2&#10;username3"></textarea>
+        <button onclick="checkBatch()">Check All</button>
+        <div id="batch-results"></div>
+      </div>
+
+      <div class="card">
+        <h3 style="margin-top:0;color:#fff;">Generate & Check</h3>
+        <div class="grid">
+          <input type="number" id="gen-length" placeholder="Length (2-32)" min="2" max="32" value="4">
+          <input type="number" id="gen-count" placeholder="Count (max 20)" min="1" max="20" value="10">
+        </div>
+        <button onclick="generateAndCheck()">Generate & Check</button>
+        <div id="gen-results"></div>
+      </div>
+      ` : `
+      <div class="card">
+        <p>Set <code>DISCORD_TOKEN</code> environment variable to start.</p>
+        <p class="info">Create a bot at <a href="https://discord.com/developers/applications" style="color:#5865f2;">Discord Developer Portal</a></p>
+      </div>
+      `}
+
+      <script>
+        async function checkSingle() {
+          const username = document.getElementById('single').value.trim();
+          if (!username) return;
+          
+          const btn = document.querySelector('button');
+          btn.classList.add('loading');
+          
+          const res = await fetch('/api/check/' + encodeURIComponent(username));
+          const data = await res.json();
+          
+          const div = document.getElementById('single-result');
+          div.className = 'result ' + (data.available ? 'available' : data.taken ? 'taken' : 'error');
+          div.innerHTML = data.available ? '✅ Available' : data.taken ? '❌ Taken' : '⚠️ ' + (data.error || 'Error');
+          
+          btn.classList.remove('loading');
+        }
+
+        async function checkBatch() {
+          const text = document.getElementById('batch').value;
+          const usernames = text.split('\\n').map(s => s.trim()).filter(s => s);
+          
+          if (usernames.length === 0) return;
+          
+          const btn = document.querySelectorAll('button')[1];
+          btn.classList.add('loading');
+          
+          const res = await fetch('/api/check-batch', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({usernames})
+          });
+          const data = await res.json();
+          
+          const div = document.getElementById('batch-results');
+          div.innerHTML = data.results.map(r => 
+            '<div class="result ' + (r.available ? 'available' : r.taken ? 'taken' : 'error') + '">' +
+            r.username + ': ' + (r.available ? 'Available' : r.taken ? 'Taken' : r.error) +
+            '</div>'
+          ).join('');
+          
+          btn.classList.remove('loading');
+        }
+
+        async function generateAndCheck() {
+          const length = document.getElementById('gen-length').value;
+          const count = document.getElementById('gen-count').value;
+          
+          const res = await fetch('/api/generate/' + length + '/' + count);
+          const data = await res.json();
+          
+          document.getElementById('batch').value = data.usernames.join('\\n');
+          checkBatch();
+        }
+      </script>
     </body>
     </html>
   `);
 });
 
-app.get('/api/refresh-proxies', async (req, res) => {
-  await initProxies();
-  res.json({ success: true, working: workingProxies.length, stats: proxyStats });
-});
-
-app.get('/api/check/:username', async (req, res) => {
-  if (!TOKEN) return res.status(500).json({ error: 'No token' });
-  if (workingProxies.length === 0) return res.status(503).json({ error: 'No working proxies' });
-  
-  const result = await apiRequest(`/users/${req.params.username.toLowerCase()}`);
-  
-  res.json({
-    username: req.params.username,
-    available: result.status === 404,
-    taken: result.status === 200,
-    status: result.status,
-    proxy_used: result.proxy ? result.proxy.replace(/\/\/.*@/, '//***@') : 'none',
-    rate_limited: result.status === 429
+// Health check
+app.get('/api/health', (req, res) => {
+  res.json({ 
+    status: 'ok', 
+    token_set: !!TOKEN,
+    timestamp: new Date().toISOString()
   });
 });
 
-app.post('/api/mass-check', async (req, res) => {
-  if (!TOKEN) return res.status(500).json({ error: 'No token' });
-  
-  const { usernames, concurrent = 5, delay = 100 } = req.body;
-  const results = { available: [], taken: [], rateLimited: [], errors: [] };
-  const startTime = Date.now();
-
-  // Process with concurrency limit
-  const queue = [...usernames.slice(0, 100)];
-  const active = new Set();
-
-  async function processOne(user) {
-    const result = await apiRequest(`/users/${user}`);
-    
-    if (result.status === 404) results.available.push(user);
-    else if (result.status === 200) results.taken.push(user);
-    else if (result.status === 429) results.rateLimited.push({ user, retryAfter: result.data?.retry_after });
-    else results.errors.push({ user, status: result.status });
-    
-    await new Promise(r => setTimeout(r, delay));
-  }
-
-  while (queue.length > 0 || active.size > 0) {
-    while (active.size < concurrent && queue.length > 0) {
-      const user = queue.shift();
-      const promise = processOne(user).finally(() => active.delete(promise));
-      active.add(promise);
-    }
-    
-    if (active.size > 0) {
-      await Promise.race(active);
-    }
-  }
-
-  res.json({
-    ...results,
-    total: usernames.length,
-    duration: Date.now() - startTime,
-    proxies_remaining: workingProxies.length - failedProxies.size,
-    requests_per_second: (usernames.length / ((Date.now() - startTime) / 1000)).toFixed(2)
-  });
-});
-
-app.get('/api/gen/:type/:count', (req, res) => {
-  const type = req.params.type;
-  const count = Math.min(parseInt(req.params.count) || 30, 200);
-  const chars = 'abcdefghijklmnopqrstuvwxyz0123456789_';
-  
-  const names = [];
-  for (let i = 0; i < count; i++) {
-    const len = type === 'any' ? 2 + Math.floor(Math.random() * 4) : parseInt(type);
-    let name = '';
-    for (let j = 0; j < len; j++) name += chars[Math.floor(Math.random() * chars.length)];
-    names.push(name);
-  }
-  res.json({ usernames: names, count: names.length });
-});
-
-// Auto-refresh proxies every 10 minutes
-setInterval(async () => {
-  console.log('Auto-refreshing proxy pool...');
-  await initProxies();
-}, 600000);
-
-// Start server
-(async () => {
-  await initProxies();
-  const valid = await validateToken();
-  
+// Start
+validateToken().then(() => {
   app.listen(PORT, () => {
-    console.log(`🚀 Server ready on port ${PORT}`);
-    console.log(`📊 Proxies: ${workingProxies.length} working | Token: ${valid ? '✅ Valid' : '❌ Missing'}`);
+    console.log(`Server running on port ${PORT}`);
+    console.log(`Token status: ${TOKEN ? 'Set' : 'Missing'}`);
   });
-})();
+});
