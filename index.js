@@ -8,12 +8,8 @@ const TOKEN = process.env.DISCORD_TOKEN;
 app.use(express.json());
 
 let botUser = null;
-let requestQueue = [];
-let processing = false;
-
-// Rate limit management
 let lastRequest = 0;
-const MIN_DELAY = 1000; // 1 second between requests to stay within limits
+const MIN_DELAY = 1000;
 
 async function discordRequest(path) {
   return new Promise((resolve) => {
@@ -30,7 +26,7 @@ async function discordRequest(path) {
         method: 'GET',
         headers: {
           'Authorization': TOKEN,
-          'User-Agent': 'DiscordBot (https://github.com/discord/discord-example-app, 1.0.0)',
+          'User-Agent': 'DiscordBot (1.0.0)',
           'Accept': 'application/json'
         },
         timeout: 10000
@@ -40,18 +36,26 @@ async function discordRequest(path) {
         let data = '';
         res.on('data', chunk => data += chunk);
         res.on('end', () => {
-          try {
-            resolve({ status: res.statusCode, data: JSON.parse(data) });
-          } catch {
-            resolve({ status: res.statusCode, data: data });
+          let parsedData = {};
+          if (data && data.trim()) {
+            try {
+              parsedData = JSON.parse(data);
+            } catch (e) {
+              parsedData = { message: data };
+            }
           }
+          
+          resolve({ 
+            status: res.statusCode, 
+            data: parsedData
+          });
         });
       });
 
-      req.on('error', (err) => resolve({ status: 0, error: err.message }));
+      req.on('error', (err) => resolve({ status: 0, error: err.message, data: {} }));
       req.on('timeout', () => {
         req.destroy();
-        resolve({ status: 0, error: 'timeout' });
+        resolve({ status: 0, error: 'timeout', data: {} });
       });
       req.end();
     }, wait);
@@ -68,15 +72,13 @@ async function validateToken() {
   return false;
 }
 
-// Check single username
 app.get('/api/check/:username', async (req, res) => {
-  if (!TOKEN) return res.status(500).json({ error: 'No token configured' });
+  if (!TOKEN) return res.status(500).json({ error: 'No token' });
   
-  const username = req.params.username.toLowerCase().replace(/\s/g, '');
+  const username = req.params.username.toLowerCase().trim();
   
-  // Validate username format
-  if (!/^[a-z0-9_.]{2,32}$/.test(username)) {
-    return res.status(400).json({ error: 'Invalid username format' });
+  if (!username || !/^[a-z0-9_.]{2,32}$/.test(username)) {
+    return res.status(400).json({ error: 'Invalid username format', username });
   }
   
   const result = await discordRequest(`/users/${username}`);
@@ -85,35 +87,37 @@ app.get('/api/check/:username', async (req, res) => {
     username: username,
     available: result.status === 404,
     taken: result.status === 200,
-    invalid: result.status === 400,
-    rate_limited: result.status === 429,
     status_code: result.status,
-    retry_after: result.data?.retry_after || null
+    error: result.error || null
   });
 });
 
-// Check multiple usernames (sequential with delays)
 app.post('/api/check-batch', async (req, res) => {
-  if (!TOKEN) return res.status(500).json({ error: 'No token configured' });
+  if (!TOKEN) return res.status(500).json({ error: 'No token' });
   
   const { usernames } = req.body;
   
   if (!Array.isArray(usernames) || usernames.length === 0) {
-    return res.status(400).json({ error: 'Provide array of usernames' });
+    return res.status(400).json({ error: 'Provide usernames array' });
   }
   
   if (usernames.length > 20) {
-    return res.status(400).json({ error: 'Max 20 usernames per batch' });
+    return res.status(400).json({ error: 'Max 20 usernames' });
   }
   
   const results = [];
-  const startTime = Date.now();
   
   for (const user of usernames) {
-    const cleanUser = user.toLowerCase().replace(/\s/g, '');
+    const cleanUser = user.toLowerCase().trim();
     
     if (!/^[a-z0-9_.]{2,32}$/.test(cleanUser)) {
-      results.push({ username: cleanUser, error: 'Invalid format', available: false });
+      results.push({ 
+        username: cleanUser, 
+        available: false, 
+        taken: false, 
+        error: 'Invalid format',
+        status_code: 400
+      });
       continue;
     }
     
@@ -123,7 +127,8 @@ app.post('/api/check-batch', async (req, res) => {
       username: cleanUser,
       available: result.status === 404,
       taken: result.status === 200,
-      status_code: result.status
+      status_code: result.status,
+      error: result.error || null
     });
   }
   
@@ -131,15 +136,13 @@ app.post('/api/check-batch', async (req, res) => {
     results: results,
     total: usernames.length,
     available_count: results.filter(r => r.available).length,
-    taken_count: results.filter(r => r.taken).length,
-    duration_ms: Date.now() - startTime
+    taken_count: results.filter(r => r.taken).length
   });
 });
 
-// Generate username suggestions
 app.get('/api/generate/:length/:count', (req, res) => {
   const length = parseInt(req.params.length) || 4;
-  const count = Math.min(parseInt(req.params.count) || 10, 50);
+  const count = Math.min(parseInt(req.params.count) || 10, 20);
   const chars = 'abcdefghijklmnopqrstuvwxyz0123456789_';
   
   const names = [];
@@ -152,10 +155,9 @@ app.get('/api/generate/:length/:count', (req, res) => {
     names.push(name);
   }
   
-  res.json({ usernames: names, count: names.length });
+  res.json({ usernames: names });
 });
 
-// Frontend
 app.get('/', async (req, res) => {
   const valid = await validateToken();
   
@@ -164,120 +166,113 @@ app.get('/', async (req, res) => {
     <html>
     <head>
       <meta name="viewport" content="width=device-width, initial-scale=1.0">
-      <title>Discord Username Checker</title>
+      <title>Username Checker</title>
       <style>
-        * { box-sizing: border-box; }
         body { 
-          background: #36393f; 
-          color: #dcddde; 
-          font-family: 'Whitney', 'Helvetica Neue', Helvetica, Arial, sans-serif; 
+          background: #1a1a1a; 
+          color: #fff; 
+          font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; 
           padding: 20px; 
           max-width: 600px; 
           margin: 0 auto;
-          line-height: 1.5;
         }
         .header { 
-          background: #2f3136; 
+          background: #2d2d2d; 
           padding: 20px; 
-          border-radius: 8px; 
+          border-radius: 12px; 
           margin-bottom: 20px;
-          border-bottom: 2px solid ${valid ? '#3ba55d' : '#ed4245'};
+          border-left: 4px solid ${valid ? '#4caf50' : '#f44336'};
         }
-        h1 { margin: 0 0 10px 0; font-size: 24px; color: #fff; }
+        h1 { margin: 0; font-size: 24px; }
         .status { 
           display: inline-block; 
-          padding: 4px 12px; 
-          border-radius: 12px; 
+          margin-top: 10px;
+          padding: 6px 12px; 
+          border-radius: 20px; 
           font-size: 12px; 
           font-weight: 600;
-          background: ${valid ? '#3ba55d' : '#ed4245'};
-          color: #fff;
+          background: ${valid ? '#4caf50' : '#f44336'};
         }
         .card { 
-          background: #2f3136; 
+          background: #2d2d2d; 
           padding: 20px; 
-          border-radius: 8px; 
+          border-radius: 12px; 
           margin-bottom: 15px; 
         }
         input, textarea { 
           width: 100%; 
           padding: 12px; 
-          background: #40444b; 
-          border: 1px solid #202225; 
-          border-radius: 4px; 
-          color: #dcddde;
+          background: #1a1a1a; 
+          border: 1px solid #444; 
+          border-radius: 8px; 
+          color: #fff;
           font-size: 14px;
           margin-bottom: 10px;
-        }
-        input:focus, textarea:focus {
-          outline: none;
-          border-color: #5865f2;
+          box-sizing: border-box;
         }
         button { 
           width: 100%; 
-          padding: 12px; 
+          padding: 14px; 
           background: #5865f2; 
           color: #fff; 
           border: none; 
-          border-radius: 4px; 
+          border-radius: 8px; 
           font-size: 14px; 
-          font-weight: 500;
+          font-weight: 600;
           cursor: pointer;
-          transition: background 0.2s;
         }
         button:hover { background: #4752c4; }
-        button:disabled { background: #4f545c; cursor: not-allowed; }
+        button:disabled { background: #444; cursor: not-allowed; }
         .result { 
           padding: 12px; 
-          border-radius: 4px; 
+          border-radius: 8px; 
           margin-top: 10px;
           font-family: monospace;
           font-size: 13px;
         }
-        .available { background: rgba(59, 165, 93, 0.2); color: #3ba55d; border: 1px solid #3ba55d; }
-        .taken { background: rgba(237, 66, 69, 0.2); color: #ed4245; border: 1px solid #ed4245; }
-        .error { background: rgba(250, 166, 26, 0.2); color: #faa61a; border: 1px solid #faa61a; }
+        .available { background: rgba(76, 175, 80, 0.2); color: #4caf50; border: 1px solid #4caf50; }
+        .taken { background: rgba(244, 67, 54, 0.2); color: #f44336; border: 1px solid #f44336; }
+        .error { background: rgba(255, 152, 0, 0.2); color: #ff9800; border: 1px solid #ff9800; }
         .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
-        .info { font-size: 12px; color: #72767d; margin-top: 5px; }
-        #results { margin-top: 15px; }
-        .loading { opacity: 0.6; pointer-events: none; }
+        .loading { opacity: 0.5; pointer-events: none; }
+        h3 { margin-top: 0; color: #fff; }
+        .info { font-size: 12px; color: #888; margin-top: 5px; }
       </style>
     </head>
     <body>
       <div class="header">
-        <h1>🔍 Discord Username Checker</h1>
-        <span class="status">${valid ? 'Bot Connected' : 'Token Required'}</span>
-        ${valid ? `<div class="info">Logged in as: ${botUser?.username || 'Unknown'}</div>` : ''}
+        <h1>🔍 Username Checker</h1>
+        <span class="status">${valid ? 'Connected' : 'Token Required'}</span>
+        ${valid ? `<div class="info">Bot: ${botUser?.username || 'Unknown'}</div>` : ''}
       </div>
 
       ${valid ? `
       <div class="card">
-        <h3 style="margin-top:0;color:#fff;">Single Check</h3>
+        <h3>Single Check</h3>
         <input type="text" id="single" placeholder="Enter username..." maxlength="32">
-        <button onclick="checkSingle()">Check Availability</button>
+        <button onclick="checkSingle()" id="btn-single">Check</button>
         <div id="single-result"></div>
       </div>
 
       <div class="card">
-        <h3 style="margin-top:0;color:#fff;">Batch Check (Max 20)</h3>
+        <h3>Batch Check</h3>
         <textarea id="batch" rows="4" placeholder="username1&#10;username2&#10;username3"></textarea>
-        <button onclick="checkBatch()">Check All</button>
+        <button onclick="checkBatch()" id="btn-batch">Check All</button>
         <div id="batch-results"></div>
       </div>
 
       <div class="card">
-        <h3 style="margin-top:0;color:#fff;">Generate & Check</h3>
+        <h3>Generate & Check</h3>
         <div class="grid">
-          <input type="number" id="gen-length" placeholder="Length (2-32)" min="2" max="32" value="4">
-          <input type="number" id="gen-count" placeholder="Count (max 20)" min="1" max="20" value="10">
+          <input type="number" id="gen-length" placeholder="Length" min="2" max="32" value="4">
+          <input type="number" id="gen-count" placeholder="Count" min="1" max="20" value="5">
         </div>
-        <button onclick="generateAndCheck()">Generate & Check</button>
+        <button onclick="generateAndCheck()" id="btn-gen">Generate & Check</button>
         <div id="gen-results"></div>
       </div>
       ` : `
       <div class="card">
         <p>Set <code>DISCORD_TOKEN</code> environment variable to start.</p>
-        <p class="info">Create a bot at <a href="https://discord.com/developers/applications" style="color:#5865f2;">Discord Developer Portal</a></p>
       </div>
       `}
 
@@ -286,15 +281,22 @@ app.get('/', async (req, res) => {
           const username = document.getElementById('single').value.trim();
           if (!username) return;
           
-          const btn = document.querySelector('button');
-          btn.classList.add('loading');
-          
-          const res = await fetch('/api/check/' + encodeURIComponent(username));
-          const data = await res.json();
-          
+          const btn = document.getElementById('btn-single');
           const div = document.getElementById('single-result');
-          div.className = 'result ' + (data.available ? 'available' : data.taken ? 'taken' : 'error');
-          div.innerHTML = data.available ? '✅ Available' : data.taken ? '❌ Taken' : '⚠️ ' + (data.error || 'Error');
+          btn.classList.add('loading');
+          div.innerHTML = 'Checking...';
+          
+          try {
+            const res = await fetch('/api/check/' + encodeURIComponent(username));
+            const data = await res.json();
+            
+            div.className = 'result ' + (data.available ? 'available' : data.taken ? 'taken' : 'error');
+            div.innerHTML = '<strong>' + data.username + '</strong>: ' + 
+              (data.available ? '✅ AVAILABLE' : data.taken ? '❌ TAKEN' : '⚠️ ERROR: ' + (data.error || data.status_code));
+          } catch (e) {
+            div.className = 'result error';
+            div.innerHTML = 'Request failed';
+          }
           
           btn.classList.remove('loading');
         }
@@ -305,22 +307,29 @@ app.get('/', async (req, res) => {
           
           if (usernames.length === 0) return;
           
-          const btn = document.querySelectorAll('button')[1];
-          btn.classList.add('loading');
-          
-          const res = await fetch('/api/check-batch', {
-            method: 'POST',
-            headers: {'Content-Type': 'application/json'},
-            body: JSON.stringify({usernames})
-          });
-          const data = await res.json();
-          
+          const btn = document.getElementById('btn-batch');
           const div = document.getElementById('batch-results');
-          div.innerHTML = data.results.map(r => 
-            '<div class="result ' + (r.available ? 'available' : r.taken ? 'taken' : 'error') + '">' +
-            r.username + ': ' + (r.available ? 'Available' : r.taken ? 'Taken' : r.error) +
-            '</div>'
-          ).join('');
+          btn.classList.add('loading');
+          div.innerHTML = 'Checking ' + usernames.length + ' usernames...';
+          
+          try {
+            const res = await fetch('/api/check-batch', {
+              method: 'POST',
+              headers: {'Content-Type': 'application/json'},
+              body: JSON.stringify({usernames})
+            });
+            const data = await res.json();
+            
+            div.innerHTML = '<div style="margin-bottom:10px;"><strong>Results:</strong> ' + 
+              data.available_count + ' available, ' + data.taken_count + ' taken</div>' +
+              data.results.map(r => 
+                '<div class="result ' + (r.available ? 'available' : r.taken ? 'taken' : 'error') + '" style="margin-bottom:5px;">' +
+                r.username + ': ' + (r.available ? '✅' : r.taken ? '❌' : '⚠️') +
+                '</div>'
+              ).join('');
+          } catch (e) {
+            div.innerHTML = 'Request failed: ' + e.message;
+          }
           
           btn.classList.remove('loading');
         }
@@ -329,31 +338,39 @@ app.get('/', async (req, res) => {
           const length = document.getElementById('gen-length').value;
           const count = document.getElementById('gen-count').value;
           
-          const res = await fetch('/api/generate/' + length + '/' + count);
-          const data = await res.json();
+          const btn = document.getElementById('btn-gen');
+          const div = document.getElementById('gen-results');
+          btn.classList.add('loading');
+          div.innerHTML = 'Generating...';
           
-          document.getElementById('batch').value = data.usernames.join('\\n');
-          checkBatch();
+          try {
+            const res = await fetch('/api/generate/' + length + '/' + count);
+            const data = await res.json();
+            
+            document.getElementById('batch').value = data.usernames.join('\\n');
+            checkBatch();
+          } catch (e) {
+            div.innerHTML = 'Failed';
+            btn.classList.remove('loading');
+          }
         }
+        
+        // Enter key support
+        document.getElementById('single')?.addEventListener('keypress', (e) => {
+          if (e.key === 'Enter') checkSingle();
+        });
       </script>
     </body>
     </html>
   `);
 });
 
-// Health check
 app.get('/api/health', (req, res) => {
-  res.json({ 
-    status: 'ok', 
-    token_set: !!TOKEN,
-    timestamp: new Date().toISOString()
-  });
+  res.json({ status: 'ok', token_set: !!TOKEN });
 });
 
-// Start
 validateToken().then(() => {
   app.listen(PORT, () => {
-    console.log(`Server running on port ${PORT}`);
-    console.log(`Token status: ${TOKEN ? 'Set' : 'Missing'}`);
+    console.log(`Server on port ${PORT} | Token: ${TOKEN ? 'OK' : 'MISSING'}`);
   });
 });
